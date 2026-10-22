@@ -1,0 +1,265 @@
+---
+- name: Prepare SSH shell for automation
+  hosts: zabbix
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Keep interactive shell decorations out of SSH automation
+      ansible.builtin.raw: |
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path.home() / '.bashrc'
+        guard = '# Ansible: interactive shell only\ncase $- in *i*) ;; *) return ;; esac\n'
+        text = p.read_text()
+        if not text.startswith(guard):
+            p.with_name('.bashrc.before-ansible').write_text(text)
+            p.write_text(guard + text)
+            print('SHELL_UPDATED')
+        PY
+      register: shell_bootstrap
+      changed_when: "'SHELL_UPDATED' in shell_bootstrap.stdout"
+
+- name: Deploy Zabbix 8.0 RC2 with Apache and MySQL
+  hosts: zabbix
+  become: true
+  environment:
+    PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  vars:
+    ansible_become_flags: '-s /bin/sh'
+    zabbix_version: '2:8.0.0~rc2-1+debian13'
+    zabbix_packages:
+      - zabbix-server-mysql
+      - zabbix-frontend-php
+      - zabbix-apache-conf
+      - zabbix-sql-scripts
+      - zabbix-agent2
+    zabbix_db_password: "{{ lookup('password', playbook_dir + '/secrets/db-password length=40 chars=ascii_letters,digits') }}"
+    zabbix_timezone: Europe/Prague
+  tasks:
+    - name: Require Debian 13 amd64
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Debian'
+          - ansible_distribution_major_version == '13'
+          - ansible_architecture == 'x86_64'
+
+    - name: Install repository prerequisites
+      ansible.builtin.apt:
+        name: [ca-certificates, gnupg, python3-pymysql]
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Download official repository keys
+      ansible.builtin.get_url:
+        url: '{{ item.url }}'
+        dest: '{{ item.dest }}'
+        mode: '0644'
+      loop:
+        - {url: 'https://repo.mysql.com/RPM-GPG-KEY-mysql-2025', dest: /usr/share/keyrings/mysql.asc}
+        - {url: 'https://repo.zabbix.com/zabbix-official-repo.key', dest: /usr/share/keyrings/zabbix.asc}
+
+    - name: Configure MySQL 8.4 LTS repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/mysql.list
+        content: "deb [signed-by=/usr/share/keyrings/mysql.asc] https://repo.mysql.com/apt/debian/ trixie mysql-8.4-lts\n"
+        mode: '0644'
+      register: mysql_repository
+
+    - name: Configure Zabbix 8.0 prerelease repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/zabbix.list
+        content: "deb [signed-by=/usr/share/keyrings/zabbix.asc] https://repo.zabbix.com/zabbix/8.0/unstable/debian/ trixie main\n"
+        mode: '0644'
+      register: zabbix_repository
+
+    - name: Pin requested RC2 packages
+      ansible.builtin.copy:
+        dest: /etc/apt/preferences.d/zabbix-rc2
+        mode: '0644'
+        content: |
+          Package: {{ zabbix_packages | join(' ') }}
+          Pin: version {{ zabbix_version }}
+          Pin-Priority: 1001
+
+    - name: Install MySQL, Apache, PHP and exact Zabbix version
+      ansible.builtin.apt:
+        name: "{{ ['mysql-community-server', 'mysql-client', 'apache2', 'libapache2-mod-php', 'php-mysql', 'locales'] + (zabbix_packages | map('regex_replace', '$', '=' + zabbix_version) | list) }}"
+        update_cache: true
+        cache_valid_time: '{{ 0 if mysql_repository.changed or zabbix_repository.changed else 3600 }}'
+        policy_rc_d: 101
+        dpkg_options: force-confdef,force-confold
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      notify:
+        - Restart Apache
+        - Restart agent
+        - Restart Zabbix server
+
+    - name: Generate frontend locale
+      ansible.builtin.lineinfile:
+        path: /etc/locale.gen
+        regexp: '^#?\s*en_US.UTF-8 UTF-8$'
+        line: en_US.UTF-8 UTF-8
+      register: locale_config
+
+    - name: Check generated locales
+      ansible.builtin.command: locale -a
+      register: generated_locales
+      changed_when: false
+
+    - name: Apply locale
+      ansible.builtin.command: locale-gen
+      when: locale_config.changed or 'en_US.utf8' not in generated_locales.stdout
+      notify: Restart Apache
+
+    - name: Tune MySQL for the 2 GB lab VM
+      ansible.builtin.copy:
+        dest: /etc/mysql/mysql.conf.d/zabbix.cnf
+        mode: '0644'
+        content: |
+          [mysqld]
+          bind-address = 127.0.0.1
+          mysqlx-bind-address = 127.0.0.1
+          character-set-server = utf8mb4
+          collation-server = utf8mb4_bin
+          innodb_buffer_pool_size = 256M
+          max_connections = 100
+      notify: Restart MySQL
+
+    - name: Enable MySQL
+      ansible.builtin.systemd:
+        name: mysql
+        state: started
+        enabled: true
+
+    - name: Create database and import schema safely
+      ansible.builtin.script: files/database.py
+      environment:
+        ZABBIX_DB_PASSWORD: '{{ zabbix_db_password }}'
+      register: database_result
+      changed_when: "'DATABASE_CHANGED' in database_result.stdout"
+      no_log: true
+
+    - name: Configure Zabbix server database
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_server.conf
+        regexp: '^#?\s*{{ item.key }}='
+        line: '{{ item.key }}={{ item.value }}'
+        owner: root
+        group: zabbix
+        mode: '0640'
+      loop:
+        - {key: DBHost, value: localhost}
+        - {key: DBName, value: zabbix}
+        - {key: DBUser, value: zabbix}
+        - {key: DBPassword, value: '{{ zabbix_db_password }}'}
+        - {key: CacheSize, value: 64M}
+      no_log: true
+      notify: Restart Zabbix server
+
+    - name: Configure frontend database connection
+      ansible.builtin.template:
+        src: zabbix.conf.php.j2
+        dest: /etc/zabbix/web/zabbix.conf.php
+        owner: root
+        group: www-data
+        mode: '0640'
+      no_log: true
+      notify: Restart Apache
+
+    - name: Allow local server to monitor its agent while preserving external monitoring
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: '^Server=(?!.*127\.0\.0\.1)(.*)$'
+        line: 'Server=\1,127.0.0.1,::1'
+        backrefs: true
+      notify: Restart agent
+
+    - name: Set PHP requirements and timezone
+      ansible.builtin.copy:
+        dest: /etc/php/8.4/apache2/conf.d/99-zabbix.ini
+        mode: '0644'
+        content: |
+          date.timezone = {{ zabbix_timezone }}
+          max_execution_time = 300
+          max_input_time = 300
+          memory_limit = 256M
+          post_max_size = 16M
+          upload_max_filesize = 2M
+      notify: Restart Apache
+
+    - name: Set Apache server name
+      ansible.builtin.copy:
+        dest: /etc/apache2/conf-available/servername.conf
+        mode: '0644'
+        content: "ServerName ansible-lab\n"
+      notify: Restart Apache
+
+    - name: Enable Apache configuration
+      ansible.builtin.command: 'a2enconf {{ item }}'
+      args:
+        creates: '/etc/apache2/conf-enabled/{{ item }}.conf'
+      loop: [zabbix, servername]
+      notify: Restart Apache
+
+    - name: Apply service changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable deployment services
+      ansible.builtin.systemd:
+        name: '{{ item }}'
+        state: started
+        enabled: true
+      loop: [mysql, apache2, zabbix-server, zabbix-agent2]
+
+    - name: Validate Apache configuration
+      ansible.builtin.command: apache2ctl configtest
+      changed_when: false
+
+    - name: Verify Zabbix API version
+      ansible.builtin.uri:
+        url: http://127.0.0.1/zabbix/api_jsonrpc.php
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: '2.0'
+          method: apiinfo.version
+          params: {}
+          id: 1
+        return_content: true
+      register: api_check
+      retries: 12
+      delay: 5
+      until: api_check.status == 200 and (api_check.json.result | default('')) == '8.0.0'
+
+    - name: Verify exact RC2 package versions
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, '-f=${Version}', '{{ item }}']
+      loop: '{{ zabbix_packages }}'
+      register: package_check
+      changed_when: false
+      failed_when: package_check.stdout != zabbix_version
+
+    - name: Wait for Zabbix server
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 10051
+        timeout: 120
+
+  handlers:
+    - name: Restart MySQL
+      ansible.builtin.systemd:
+        name: mysql
+        state: restarted
+    - name: Restart Apache
+      ansible.builtin.systemd:
+        name: apache2
+        state: restarted
+    - name: Restart agent
+      ansible.builtin.systemd:
+        name: zabbix-agent2
+        state: restarted
+    - name: Restart Zabbix server
+      ansible.builtin.systemd:
+        name: zabbix-server
+        state: restarted
